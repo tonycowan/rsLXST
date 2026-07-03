@@ -355,6 +355,7 @@ fn register_interface_entry(
         tx_drops: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ingress: IngressController::new(),
         announce_queue: Vec::new(),
+        multipoint: false,
     };
     (handle.id, entry, handle.read_task)
 }
