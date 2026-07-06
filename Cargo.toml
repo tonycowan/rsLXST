@@ -5,6 +5,9 @@ members = [
     "crates/lxst-rns",
     "crates/lxst-telephony",
 ]
+exclude = [
+    "vendor/codec2-sys",
+]
 
 [workspace.package]
 version = "0.1.1"

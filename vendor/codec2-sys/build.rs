@@ -33,6 +33,9 @@ fn main() {
     println!("cargo:rustc-link-lib=codec2");
 
     let bindings = builder
+        .blocklist_item("__bool_true_false_are_defined")
+        .blocklist_item("true_")
+        .blocklist_item("false_")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
         .generate()
         .expect("Unable to generate bindings; install libcodec2 development headers");
