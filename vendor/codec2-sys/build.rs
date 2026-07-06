@@ -76,9 +76,7 @@ fn discover_include_dir() -> Option<String> {
         "/usr/include".to_string(),
     ]);
 
-    candidates
-        .into_iter()
-        .find(|dir| codec2_header_in(dir))
+    candidates.into_iter().find(|dir| codec2_header_in(dir))
 }
 
 fn discover_library_dir(include_dir: &str) -> Option<PathBuf> {
@@ -109,9 +107,7 @@ fn discover_library_dir(include_dir: &str) -> Option<PathBuf> {
 }
 
 fn codec2_header_in(include_dir: &str) -> bool {
-    Path::new(include_dir)
-        .join("codec2/codec2.h")
-        .is_file()
+    Path::new(include_dir).join("codec2/codec2.h").is_file()
 }
 
 fn library_present(library_dir: &Path) -> bool {
@@ -155,7 +151,10 @@ fn brew_bins() -> [&'static str; 3] {
 }
 
 fn brew_prefix_with(brew: &str, formula: &str) -> Option<String> {
-    let output = Command::new(brew).args(["--prefix", formula]).output().ok()?;
+    let output = Command::new(brew)
+        .args(["--prefix", formula])
+        .output()
+        .ok()?;
     if !output.status.success() {
         return None;
     }
