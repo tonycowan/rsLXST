@@ -75,7 +75,7 @@ impl NativeCodec2 {
             Codec2Mode::Mode2400 => codec2_sys::CODEC2_MODE_2400,
             Codec2Mode::Mode3200 => codec2_sys::CODEC2_MODE_3200,
         };
-        let handle = unsafe { codec2_sys::codec2_create(ffi_mode) };
+        let handle = unsafe { codec2_sys::codec2_create(ffi_mode as i32) };
         if handle.is_null() {
             return Err(Codec2CodecError::Codec(format!(
                 "codec2_create failed for {mode:?}"
