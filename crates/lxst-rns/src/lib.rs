@@ -6,8 +6,9 @@
 
 use bytes::Bytes;
 use lxst_core::{
-    DropPolicy, Frame, FramePacketizer, FrameStreamEvent, FrameStreamState, JitterBuffer,
-    JitterPush, JitterStats, LxstPacket, OpusDecoderState, RawAudioFrame, RawBitDepth,
+    Codec2DecoderState, DropPolicy, Frame, FramePacketizer, FrameStreamEvent, FrameStreamState,
+    JitterBuffer, JitterPush, JitterStats, LxstPacket, OpusDecoderState, RawAudioFrame,
+    RawBitDepth,
 };
 use rns_link::link::{Link, LinkState};
 use rns_transport::messages::{OutboundRequest, TransportMessage};
@@ -22,6 +23,8 @@ pub enum Error {
     Stream(#[from] lxst_core::StreamError),
     #[error("LXST Opus codec error: {0}")]
     Opus(#[from] lxst_core::OpusCodecError),
+    #[error("LXST Codec2 codec error: {0}")]
+    Codec2(#[from] lxst_core::Codec2CodecError),
     #[error("Reticulum link is not active: {0:?}")]
     LinkNotActive(LinkState),
     #[error("LXST payload length {payload_len} exceeds link MDU {mdu}")]
@@ -195,6 +198,15 @@ impl LxstMediaIngress {
             .map(|frame| decoder.decode_frame(&frame).map_err(Error::from))
             .transpose()
     }
+
+    pub fn pop_codec2_frame(
+        &mut self,
+        decoder: &mut Codec2DecoderState,
+    ) -> Result<Option<RawAudioFrame>, Error> {
+        self.pop_frame()
+            .map(|frame| decoder.decode_frame(&frame).map_err(Error::from))
+            .transpose()
+    }
 }
 
 /// Encode and encrypt an LXST packet for transmission over an active Reticulum
@@ -288,8 +300,9 @@ fn queue_packed_link_packet(
 mod tests {
     use super::*;
     use lxst_core::{
-        CodecKind, DropPolicy, Frame, FrameStreamEvent, OpusDecoderState, OpusEncoderState,
-        Profile, Signal, SignallingStatus, SyntheticSource, SyntheticSourceKind,
+        Codec2DecoderState, Codec2EncoderState, CodecKind, DropPolicy, Frame, FrameStreamEvent,
+        OpusDecoderState, OpusEncoderState, Profile, Signal, SignallingStatus, SyntheticSource,
+        SyntheticSourceKind,
     };
     use rns_crypto::ed25519::Ed25519PrivateKey;
 
@@ -641,6 +654,69 @@ mod tests {
 
         assert_eq!(decoded_frames.len(), raw_frames.len());
         assert_eq!(ingress.current_codec(), Some(CodecKind::Opus));
+        for frame in decoded_frames {
+            assert_eq!(frame.channels, profile.channels());
+            assert_eq!(frame.sample_frames(), profile.sample_frames_per_packet());
+        }
+        assert_eq!(
+            ingress.jitter_stats(),
+            JitterStats {
+                pushed: 12,
+                popped: 12,
+                dropped_oldest: 0,
+                dropped_newest: 0,
+                underruns: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn sustained_codec2_source_survives_link_media_flow() {
+        let (initiator, responder) = active_link_pair();
+        let profile = Profile::BandwidthVeryLow;
+        let mut source = SyntheticSource::new(
+            profile.channels(),
+            profile.sample_rate_hz(),
+            profile.sample_frames_per_packet(),
+            SyntheticSourceKind::Sine {
+                frequency_hz: 440.0,
+                amplitude: 0.25,
+            },
+        )
+        .unwrap();
+        let raw_frames = (0..12)
+            .map(|_| source.next_raw_frame().unwrap())
+            .collect::<Vec<_>>();
+        let mut encoder = Codec2EncoderState::new(profile).unwrap();
+        let codec2_frames = raw_frames
+            .iter()
+            .map(|frame| encoder.encode_frame(frame).unwrap())
+            .collect::<Vec<_>>();
+
+        let packed = LxstMediaEgress::PYTHON_COMPATIBLE
+            .pack_frames(&initiator, codec2_frames)
+            .unwrap();
+        assert_eq!(packed.len(), raw_frames.len());
+
+        let mut ingress = LxstMediaIngress::new(16, DropPolicy::DropOldest).unwrap();
+        for packet in packed {
+            let (_header, data_offset) =
+                rns_wire::header::PacketHeader::unpack(&packet.raw).unwrap();
+            let plaintext = responder.decrypt(&packet.raw[data_offset..]).unwrap();
+            let result = ingress
+                .accept_plaintext(responder.link_id, &plaintext)
+                .unwrap();
+            assert_eq!(result.jitter_pushes, vec![JitterPush::Accepted]);
+        }
+
+        let mut decoder = Codec2DecoderState::new(profile).unwrap();
+        let mut decoded_frames = Vec::new();
+        while let Some(frame) = ingress.pop_codec2_frame(&mut decoder).unwrap() {
+            decoded_frames.push(frame);
+        }
+
+        assert_eq!(decoded_frames.len(), raw_frames.len());
+        assert_eq!(ingress.current_codec(), Some(CodecKind::Codec2));
         for frame in decoded_frames {
             assert_eq!(frame.channels, profile.channels());
             assert_eq!(frame.sample_frames(), profile.sample_frames_per_packet());

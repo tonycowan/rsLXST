@@ -402,6 +402,27 @@ impl Codec2Mode {
             Self::Mode3200 => 3200,
         }
     }
+
+    pub const fn samples_per_frame(self) -> usize {
+        match self {
+            Self::Mode700C | Self::Mode1200 | Self::Mode1300 | Self::Mode1400 | Self::Mode1600 => {
+                320
+            }
+            Self::Mode2400 | Self::Mode3200 => 160,
+        }
+    }
+
+    pub const fn bytes_per_frame(self) -> usize {
+        match self {
+            Self::Mode700C => 4,
+            Self::Mode1200 => 6,
+            Self::Mode1300 => 7,
+            Self::Mode1400 => 7,
+            Self::Mode1600 => 8,
+            Self::Mode2400 => 6,
+            Self::Mode3200 => 8,
+        }
+    }
 }
 
 #[cfg(test)]

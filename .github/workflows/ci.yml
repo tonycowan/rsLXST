@@ -39,7 +39,7 @@ jobs:
           workspaces: rsLXST -> target
           cache-bin: false
       - name: Install Linux system deps
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config libopus0 libogg0
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config libopus0 libogg0 libcodec2-dev
       - run: cargo fmt --all -- --check
         working-directory: rsLXST
       - run: cargo clippy --workspace -- -D warnings
@@ -84,13 +84,17 @@ jobs:
           cache-bin: false
       - name: Install Linux system deps
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config libopus0 libogg0
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev libdbus-1-dev pkg-config libopus0 libogg0 libcodec2-dev
       - name: Install macOS Opus runtime
         if: runner.os == 'macOS'
-        run: brew install opus libogg
+        run: brew install opus libogg codec2
       - name: Install Python interop deps
         run: python -m pip install --upgrade pip && python -m pip install numpy cryptography pyserial cffi "audioop-lts; python_version >= '3.13'"
       - run: cargo test --workspace
+        working-directory: rsLXST
+      - name: Test Codec2 700C with libcodec2
+        if: runner.os != 'Windows'
+        run: cargo test -p lxst-core --features libcodec2 codec2_700c_roundtrip_with_libcodec2
         working-directory: rsLXST
 
   mobile-check:

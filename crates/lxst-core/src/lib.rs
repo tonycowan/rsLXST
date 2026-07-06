@@ -4,6 +4,7 @@
 //! avoids audio and Reticulum runtime dependencies so packet/profile parity can
 //! be tested in isolation.
 
+mod codec2;
 mod opus;
 mod profile;
 mod raw;
@@ -12,6 +13,7 @@ mod synthetic;
 mod telephony;
 mod wire;
 
+pub use codec2::{Codec2CodecError, Codec2DecoderState, Codec2EncoderState};
 pub use opus::{OpusCodecError, OpusDecoderState, OpusEncoderState};
 pub use profile::{AudioCodec, OpusApplication, OpusProfile, Profile, SignallingStatus};
 pub use raw::RawAudioFrame;
