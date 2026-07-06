@@ -1,0 +1,12 @@
+[package]
+name = "codec2-sys"
+description = "System bindings for codec2 (vendored with portable build discovery)"
+version = "1.0.0"
+edition = "2021"
+license = "LGPL-2.1"
+readme = "README.md"
+repository = "https://github.com/yuvadm/codec2-sys"
+resolver = "2"
+
+[build-dependencies]
+bindgen = "0.60.1"

@@ -233,8 +233,6 @@ checksum = "2cefd04ca4a2f096acf5f44da5e5931436d030a620901f1fe8fa773e6b9de65b"
 [[package]]
 name = "codec2-sys"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63d35a83f1b75f8bf066af361ce2c8f2d877f9c481b2fc22b1e565dea5c81bde"
 dependencies = [
  "bindgen",
 ]

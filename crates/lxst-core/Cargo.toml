@@ -7,7 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 codec2.workspace = true
-codec2-sys = { version = "1.0", optional = true }
+codec2-sys = { path = "../../vendor/codec2-sys", optional = true }
 half.workspace = true
 opus-rs.workspace = true
 rmpv.workspace = true

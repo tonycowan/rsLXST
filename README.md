@@ -215,8 +215,17 @@ Codec2 modes 1200–3200 use the pure-Rust `codec2` crate. Mode 700C requires th
 optional `libcodec2` feature and a system `libcodec2` install:
 
 ```bash
+# Debian/Ubuntu/Raspberry Pi OS
+sudo apt install libcodec2-dev pkg-config
+
+# macOS
+brew install codec2 pkg-config
+
 cargo test -p lxst-core --features libcodec2
 ```
+
+If headers or libraries live outside the usual paths, set `CODEC2_INCLUDE_DIR`
+and `CODEC2_LIBRARY_DIR` before building.
 
 Applications still own platform integration:
 
