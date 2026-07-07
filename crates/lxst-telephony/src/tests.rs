@@ -1,6 +1,7 @@
 use super::*;
 use lxst_core::{
-    CodecKind, OpusDecoderState, OpusEncoderState, SyntheticSource, SyntheticSourceKind,
+    Codec2DecoderState, Codec2EncoderState, CodecKind, OpusDecoderState, OpusEncoderState,
+    SyntheticSource, SyntheticSourceKind,
 };
 use rns_crypto::ed25519::Ed25519PrivateKey;
 use rns_identity::announce::AnnounceData;
@@ -186,6 +187,28 @@ fn queue_inbound_opus_frame(
 ) {
     let opus_frame = encoder.encode_frame(&frame).unwrap();
     let plaintext = LxstPacket::frame(opus_frame).encode().unwrap();
+    let encrypted = receiver.encrypt(&plaintext).unwrap();
+    link_event_tx
+        .try_send(DestinationEvent::InboundPacket {
+            raw: Bytes::from(link_data_packet(
+                link_id,
+                rns_wire::context::PacketContext::None,
+                &encrypted,
+            )),
+            interface_id: 1,
+        })
+        .unwrap();
+}
+
+fn queue_inbound_codec2_frame(
+    link_event_tx: &mpsc::Sender<DestinationEvent>,
+    receiver: &Link,
+    link_id: LinkId,
+    encoder: &mut Codec2EncoderState,
+    frame: RawAudioFrame,
+) {
+    let codec2_frame = encoder.encode_frame(&frame).unwrap();
+    let plaintext = LxstPacket::frame(codec2_frame).encode().unwrap();
     let encrypted = receiver.encrypt(&plaintext).unwrap();
     link_event_tx
         .try_send(DestinationEvent::InboundPacket {
@@ -2050,6 +2073,195 @@ async fn telephony_service_send_opus_frames_queues_decodeable_quality_media() {
     let _commands = service.core.hangup_active(false).unwrap();
     service.refresh_active_timeout();
     assert!(service.media.opus_encoder.is_none());
+}
+
+#[tokio::test]
+async fn telephony_service_send_codec2_frames_queues_decodeable_bandwidth_media() {
+    let (sender, receiver) = active_link_pair();
+    let link_id = sender.link_id;
+    let profile = Profile::BandwidthVeryLow;
+    let frame = synthetic_frame_for_profile(profile);
+    let local_identity = Identity::new();
+    let remote_identity = identity(0xB7);
+
+    let (transport_tx, mut transport_rx) = mpsc::channel(4);
+    let mut endpoint = TelephonyRnsEndpoint::register(transport_tx, &local_identity).unwrap();
+    let _listener_registration = transport_rx.try_recv().unwrap();
+    let (_event_tx, event_rx) = mpsc::channel(1);
+    endpoint.outgoing_links.insert(
+        link_id,
+        OutgoingLinkState {
+            link: sender,
+            event_rx,
+        },
+    );
+
+    let mut core = TelephonyRuntimeCore::new();
+    core.start_outgoing_call(link_id, remote_identity, Some(profile))
+        .unwrap();
+    for status in [
+        SignallingStatus::Available,
+        SignallingStatus::Ringing,
+        SignallingStatus::Connecting,
+        SignallingStatus::Established,
+    ] {
+        core.accept_lxst_plaintext(link_id, &packet([Signal::from(status)]))
+            .unwrap();
+    }
+
+    let (_control_tx, control_rx) = mpsc::channel(1);
+    let (event_tx, mut service_events) = mpsc::channel(4);
+    let mut service = TelephonyService::new(endpoint, core, control_rx, event_tx);
+
+    service
+        .send_codec2_frames(profile, vec![frame.clone()])
+        .await
+        .unwrap();
+    assert_eq!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::MediaSent {
+            link_id,
+            frames: 1,
+            packets: 1,
+        }
+    );
+
+    let (header, encrypted) = take_outbound(&mut transport_rx);
+    assert_eq!(header.destination_hash, link_id);
+    let plaintext = receiver.decrypt(&encrypted).unwrap();
+    let packet = LxstPacket::decode(&plaintext).unwrap();
+    assert_eq!(packet.frames.len(), 1);
+    assert_eq!(packet.frames[0].codec, CodecKind::Codec2);
+    assert_eq!(packet.frames[0].payload[0], 0x04);
+
+    let mut decoder = Codec2DecoderState::new(profile).unwrap();
+    let decoded = decoder.decode_frame(&packet.frames[0]).unwrap();
+    assert_eq!(decoded.channels, profile.channels());
+    assert_eq!(decoded.sample_frames(), profile.sample_frames_per_packet());
+
+    assert!(matches!(
+        service
+            .send_codec2_frames(
+                Profile::QualityMedium,
+                vec![synthetic_frame_for_profile(Profile::QualityMedium)]
+            )
+            .await,
+        Err(Error::MediaProfileMismatch {
+            active: Profile::BandwidthVeryLow,
+            requested: Profile::QualityMedium,
+        })
+    ));
+
+    let _commands = service.core.hangup_active(false).unwrap();
+    service.refresh_active_timeout();
+    assert!(service.media.codec2_encoder.is_none());
+}
+
+#[tokio::test]
+async fn telephony_service_decodes_inbound_codec2_frames_with_call_profile() {
+    let profile = Profile::BandwidthLow;
+    let (mut service, receiver, link_id, link_event_tx, mut service_events) =
+        established_outgoing_service(profile, 0xB8, 8);
+    let mut encoder = Codec2EncoderState::new(profile).unwrap();
+
+    queue_inbound_codec2_frame(
+        &link_event_tx,
+        &receiver,
+        link_id,
+        &mut encoder,
+        synthetic_frame_for_profile(profile),
+    );
+
+    assert!(service.drive_ready().await);
+    assert!(matches!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::Drive(_)
+    ));
+    assert_eq!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::MediaReceived { link_id, frames: 1 }
+    );
+    let decoded = service_events.recv().await.unwrap();
+    match decoded {
+        TelephonyServiceEvent::Codec2FramesReceived {
+            frames,
+            profile: event_profile,
+            link_id: event_link,
+        } => {
+            assert_eq!(event_link, link_id);
+            assert_eq!(event_profile, profile);
+            assert_eq!(frames.len(), 1);
+            assert_eq!(
+                frames[0].sample_frames(),
+                profile.sample_frames_per_packet()
+            );
+        }
+        other => panic!("expected decoded Codec2 frames event, got {other:?}"),
+    }
+    assert_eq!(service.media.codec2_decoder_generation, 1);
+}
+
+#[tokio::test]
+async fn telephony_service_delivers_decoded_codec2_to_receive_stream() {
+    let profile = Profile::BandwidthVeryLow;
+    let (mut service, receiver, link_id, link_event_tx, mut service_events) =
+        established_outgoing_service(profile, 0xB9, 16);
+    let (sink_tx, mut sink_rx) = mpsc::channel(4);
+
+    service.start_codec2_receive_stream(sink_tx).await.unwrap();
+    assert_eq!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::Codec2ReceiveStreamStarted { link_id, profile }
+    );
+
+    let mut encoder = Codec2EncoderState::new(profile).unwrap();
+    queue_inbound_codec2_frame(
+        &link_event_tx,
+        &receiver,
+        link_id,
+        &mut encoder,
+        synthetic_frame_for_profile(profile),
+    );
+
+    assert!(service.drive_ready().await);
+    assert!(matches!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::Drive(_)
+    ));
+    assert_eq!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::MediaReceived { link_id, frames: 1 }
+    );
+    assert!(matches!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::Codec2FramesReceived {
+            link_id: event_link,
+            profile: event_profile,
+            frames,
+        } if event_link == link_id
+            && event_profile == profile
+            && frames.len() == 1
+    ));
+    assert_eq!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::Codec2ReceiveStreamFrames {
+            link_id,
+            profile,
+            frames: 1,
+            dropped: 0,
+        }
+    );
+    assert!(matches!(
+        service_events.recv().await.unwrap(),
+        TelephonyServiceEvent::Snapshot(_)
+    ));
+
+    let delivered = sink_rx.try_recv().unwrap();
+    assert_eq!(delivered.channels, profile.channels());
+    assert_eq!(
+        delivered.sample_frames(),
+        profile.sample_frames_per_packet()
+    );
 }
 
 #[tokio::test]

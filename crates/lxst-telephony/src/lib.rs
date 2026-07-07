@@ -10,9 +10,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use lxst_core::{
-    CallRole, CodecKind, Frame, FrameStreamEvent, LxstPacket, OpusCodecError, OpusDecoderState,
-    OpusEncoderState, Profile, RawAudioFrame, RawBitDepth, Signal, SignallingStatus,
-    TELEPHONY_DESTINATION_NAME, TelephonyAction, TelephonyCall,
+    CallRole, Codec2CodecError, Codec2DecoderState, Codec2EncoderState, CodecKind, Frame,
+    FrameStreamEvent, LxstPacket, OpusCodecError, OpusDecoderState, OpusEncoderState, Profile,
+    RawAudioFrame, RawBitDepth, Signal, SignallingStatus, TELEPHONY_DESTINATION_NAME,
+    TelephonyAction, TelephonyCall,
 };
 use lxst_rns::{InboundLxstPacket, LxstLinkIngress, LxstMediaEgress, queue_lxst_link_packet};
 use rns_crypto::ed25519::Ed25519PublicKey;
@@ -47,6 +48,8 @@ pub enum Error {
     Rns(#[from] lxst_rns::Error),
     #[error("LXST Opus codec error: {0}")]
     Opus(#[from] OpusCodecError),
+    #[error("LXST Codec2 codec error: {0}")]
+    Codec2(#[from] Codec2CodecError),
     #[error("unknown LXST link")]
     UnknownLink,
     #[error("line is busy")]
@@ -695,6 +698,19 @@ pub enum TelephonyControl {
         frames: mpsc::Sender<RawAudioFrame>,
     },
     StopOpusReceiveStream,
+    SendCodec2Frames {
+        profile: Profile,
+        frames: Vec<RawAudioFrame>,
+    },
+    StartCodec2Stream {
+        profile: Profile,
+        frames: mpsc::Receiver<RawAudioFrame>,
+    },
+    StopCodec2Stream,
+    StartCodec2ReceiveStream {
+        frames: mpsc::Sender<RawAudioFrame>,
+    },
+    StopCodec2ReceiveStream,
     SwitchProfile {
         profile: Profile,
     },
@@ -714,6 +730,24 @@ pub enum OpusTransmitStreamStopReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpusReceiveStreamStopReason {
+    Requested,
+    Replaced,
+    SinkClosed,
+    CallEnded,
+    ProfileChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec2TransmitStreamStopReason {
+    Requested,
+    Replaced,
+    SourceClosed,
+    CallEnded,
+    ProfileChanged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec2ReceiveStreamStopReason {
     Requested,
     Replaced,
     SinkClosed,
@@ -775,6 +809,35 @@ pub enum TelephonyServiceEvent {
         reason: OpusReceiveStreamStopReason,
     },
     OpusReceiveStreamFrames {
+        link_id: LinkId,
+        profile: Profile,
+        frames: usize,
+        dropped: usize,
+    },
+    Codec2FramesReceived {
+        link_id: LinkId,
+        profile: Profile,
+        frames: Vec<RawAudioFrame>,
+    },
+    Codec2TransmitStreamStarted {
+        link_id: LinkId,
+        profile: Profile,
+    },
+    Codec2TransmitStreamStopped {
+        link_id: LinkId,
+        profile: Profile,
+        reason: Codec2TransmitStreamStopReason,
+    },
+    Codec2ReceiveStreamStarted {
+        link_id: LinkId,
+        profile: Profile,
+    },
+    Codec2ReceiveStreamStopped {
+        link_id: LinkId,
+        profile: Profile,
+        reason: Codec2ReceiveStreamStopReason,
+    },
+    Codec2ReceiveStreamFrames {
         link_id: LinkId,
         profile: Profile,
         frames: usize,
@@ -872,6 +935,12 @@ struct TelephonyServiceMedia {
     opus_decoder_generation: u64,
     opus_transmit_stream: Option<ActiveOpusTransmitStream>,
     opus_receive_stream: Option<ActiveOpusReceiveStream>,
+    codec2_encoder: Option<ActiveCodec2Encoder>,
+    codec2_encoder_generation: u64,
+    codec2_decoder: Option<ActiveCodec2Decoder>,
+    codec2_decoder_generation: u64,
+    codec2_transmit_stream: Option<ActiveCodec2TransmitStream>,
+    codec2_receive_stream: Option<ActiveCodec2ReceiveStream>,
 }
 
 struct ActiveOpusEncoder {
@@ -898,6 +967,30 @@ struct ActiveOpusReceiveStream {
     frames_tx: mpsc::Sender<RawAudioFrame>,
 }
 
+struct ActiveCodec2Encoder {
+    link_id: LinkId,
+    profile: Profile,
+    encoder: Codec2EncoderState,
+}
+
+struct ActiveCodec2Decoder {
+    link_id: LinkId,
+    profile: Profile,
+    decoder: Codec2DecoderState,
+}
+
+struct ActiveCodec2TransmitStream {
+    link_id: LinkId,
+    profile: Profile,
+    frames_rx: mpsc::Receiver<RawAudioFrame>,
+}
+
+struct ActiveCodec2ReceiveStream {
+    link_id: LinkId,
+    profile: Profile,
+    frames_tx: mpsc::Sender<RawAudioFrame>,
+}
+
 impl TelephonyServiceMedia {
     fn clear_unless_established(
         &mut self,
@@ -908,6 +1001,8 @@ impl TelephonyServiceMedia {
         else {
             self.opus_encoder = None;
             self.opus_decoder = None;
+            self.codec2_encoder = None;
+            self.codec2_decoder = None;
             if let Some(stream) = self.opus_transmit_stream.take() {
                 events.push(TelephonyServiceEvent::OpusTransmitStreamStopped {
                     link_id: stream.link_id,
@@ -920,6 +1015,20 @@ impl TelephonyServiceMedia {
                     link_id: stream.link_id,
                     profile: stream.profile,
                     reason: OpusReceiveStreamStopReason::CallEnded,
+                });
+            }
+            if let Some(stream) = self.codec2_transmit_stream.take() {
+                events.push(TelephonyServiceEvent::Codec2TransmitStreamStopped {
+                    link_id: stream.link_id,
+                    profile: stream.profile,
+                    reason: Codec2TransmitStreamStopReason::CallEnded,
+                });
+            }
+            if let Some(stream) = self.codec2_receive_stream.take() {
+                events.push(TelephonyServiceEvent::Codec2ReceiveStreamStopped {
+                    link_id: stream.link_id,
+                    profile: stream.profile,
+                    reason: Codec2ReceiveStreamStopReason::CallEnded,
                 });
             }
             return events;
@@ -965,6 +1074,52 @@ impl TelephonyServiceMedia {
                     OpusReceiveStreamStopReason::CallEnded
                 };
                 events.push(TelephonyServiceEvent::OpusReceiveStreamStopped {
+                    link_id: stream.link_id,
+                    profile: stream.profile,
+                    reason,
+                });
+            }
+        }
+        if self
+            .codec2_encoder
+            .as_ref()
+            .is_some_and(|encoder| encoder.link_id != active.link_id)
+        {
+            self.codec2_encoder = None;
+        }
+        if self
+            .codec2_decoder
+            .as_ref()
+            .is_some_and(|decoder| decoder.link_id != active.link_id)
+        {
+            self.codec2_decoder = None;
+        }
+        if self.codec2_transmit_stream.as_ref().is_some_and(|stream| {
+            stream.link_id != active.link_id || Some(stream.profile) != active.profile
+        }) {
+            if let Some(stream) = self.codec2_transmit_stream.take() {
+                let reason = if stream.link_id == active.link_id {
+                    Codec2TransmitStreamStopReason::ProfileChanged
+                } else {
+                    Codec2TransmitStreamStopReason::CallEnded
+                };
+                events.push(TelephonyServiceEvent::Codec2TransmitStreamStopped {
+                    link_id: stream.link_id,
+                    profile: stream.profile,
+                    reason,
+                });
+            }
+        }
+        if self.codec2_receive_stream.as_ref().is_some_and(|stream| {
+            stream.link_id != active.link_id || Some(stream.profile) != active.profile
+        }) {
+            if let Some(stream) = self.codec2_receive_stream.take() {
+                let reason = if stream.link_id == active.link_id {
+                    Codec2ReceiveStreamStopReason::ProfileChanged
+                } else {
+                    Codec2ReceiveStreamStopReason::CallEnded
+                };
+                events.push(TelephonyServiceEvent::Codec2ReceiveStreamStopped {
                     link_id: stream.link_id,
                     profile: stream.profile,
                     reason,
@@ -1023,6 +1178,58 @@ impl TelephonyServiceMedia {
             .opus_decoder
             .as_mut()
             .expect("Opus decoder exists after creation")
+            .decoder)
+    }
+
+    fn codec2_encoder_for(
+        &mut self,
+        link_id: LinkId,
+        profile: Profile,
+    ) -> Result<&mut Codec2EncoderState, Codec2CodecError> {
+        let needs_new = self
+            .codec2_encoder
+            .as_ref()
+            .is_none_or(|encoder| encoder.link_id != link_id || encoder.profile != profile);
+
+        if needs_new {
+            self.codec2_encoder_generation += 1;
+            self.codec2_encoder = Some(ActiveCodec2Encoder {
+                link_id,
+                profile,
+                encoder: Codec2EncoderState::new(profile)?,
+            });
+        }
+
+        Ok(&mut self
+            .codec2_encoder
+            .as_mut()
+            .expect("Codec2 encoder exists after creation")
+            .encoder)
+    }
+
+    fn codec2_decoder_for(
+        &mut self,
+        link_id: LinkId,
+        profile: Profile,
+    ) -> Result<&mut Codec2DecoderState, Codec2CodecError> {
+        let needs_new = self
+            .codec2_decoder
+            .as_ref()
+            .is_none_or(|decoder| decoder.link_id != link_id || decoder.profile != profile);
+
+        if needs_new {
+            self.codec2_decoder_generation += 1;
+            self.codec2_decoder = Some(ActiveCodec2Decoder {
+                link_id,
+                profile,
+                decoder: Codec2DecoderState::new(profile)?,
+            });
+        }
+
+        Ok(&mut self
+            .codec2_decoder
+            .as_mut()
+            .expect("Codec2 decoder exists after creation")
             .decoder)
     }
 }
@@ -1166,6 +1373,9 @@ impl TelephonyService {
                     if !self.pump_opus_stream().await {
                         break;
                     }
+                    if !self.pump_codec2_stream().await {
+                        break;
+                    }
                 }
             }
         }
@@ -1302,6 +1512,34 @@ impl TelephonyService {
             TelephonyControl::StopOpusReceiveStream => {
                 return self
                     .stop_opus_receive_stream(OpusReceiveStreamStopReason::Requested)
+                    .await;
+            }
+            TelephonyControl::SendCodec2Frames { profile, frames } => {
+                return match self.send_codec2_frames(profile, frames).await {
+                    Ok(()) => true,
+                    Err(err) => emit_service_error(self.event_tx.clone(), err).await,
+                };
+            }
+            TelephonyControl::StartCodec2Stream { profile, frames } => {
+                return match self.start_codec2_stream(profile, frames).await {
+                    Ok(()) => true,
+                    Err(err) => emit_service_error(self.event_tx.clone(), err).await,
+                };
+            }
+            TelephonyControl::StopCodec2Stream => {
+                return self
+                    .stop_codec2_stream(Codec2TransmitStreamStopReason::Requested)
+                    .await;
+            }
+            TelephonyControl::StartCodec2ReceiveStream { frames } => {
+                return match self.start_codec2_receive_stream(frames).await {
+                    Ok(()) => true,
+                    Err(err) => emit_service_error(self.event_tx.clone(), err).await,
+                };
+            }
+            TelephonyControl::StopCodec2ReceiveStream => {
+                return self
+                    .stop_codec2_receive_stream(Codec2ReceiveStreamStopReason::Requested)
                     .await;
             }
             TelephonyControl::SwitchProfile { profile } => {
@@ -1712,6 +1950,15 @@ impl TelephonyService {
                             Vec::new()
                         }
                     };
+                    let codec2_received_events = match self.codec2_received_events(&step.step) {
+                        Ok(events) => events,
+                        Err(err) => {
+                            if !emit_service_error(self.event_tx.clone(), err).await {
+                                return false;
+                            }
+                            Vec::new()
+                        }
+                    };
                     if !emit_service_event(
                         self.event_tx.clone(),
                         TelephonyServiceEvent::Drive(step),
@@ -1731,6 +1978,11 @@ impl TelephonyService {
                         return false;
                     }
                     for event in opus_received_events {
+                        if !emit_service_event(self.event_tx.clone(), event).await {
+                            return false;
+                        }
+                    }
+                    for event in codec2_received_events {
                         if !emit_service_event(self.event_tx.clone(), event).await {
                             return false;
                         }
@@ -1844,6 +2096,286 @@ impl TelephonyService {
                 link_id: stream.link_id,
                 profile: stream.profile,
                 reason: OpusReceiveStreamStopReason::SinkClosed,
+            });
+        }
+        events
+    }
+
+    async fn start_codec2_receive_stream(
+        &mut self,
+        frames_tx: mpsc::Sender<RawAudioFrame>,
+    ) -> Result<(), Error> {
+        let active = self.core.active_call().ok_or(Error::NoActiveCall)?;
+        if active.call.status() != SignallingStatus::Established {
+            return Err(Error::CallNotEstablished);
+        }
+
+        let link_id = active.link_id;
+        let profile = active.call.profile().unwrap_or(Profile::DEFAULT);
+        self.stop_codec2_receive_stream(Codec2ReceiveStreamStopReason::Replaced)
+            .await;
+        self.media.codec2_receive_stream = Some(ActiveCodec2ReceiveStream {
+            link_id,
+            profile,
+            frames_tx,
+        });
+
+        if emit_service_event(
+            self.event_tx.clone(),
+            TelephonyServiceEvent::Codec2ReceiveStreamStarted { link_id, profile },
+        )
+        .await
+        {
+            Ok(())
+        } else {
+            Err(Error::ServiceEventClosed)
+        }
+    }
+
+    async fn stop_codec2_receive_stream(&mut self, reason: Codec2ReceiveStreamStopReason) -> bool {
+        let Some(stream) = self.media.codec2_receive_stream.take() else {
+            return true;
+        };
+        emit_service_event(
+            self.event_tx.clone(),
+            TelephonyServiceEvent::Codec2ReceiveStreamStopped {
+                link_id: stream.link_id,
+                profile: stream.profile,
+                reason,
+            },
+        )
+        .await
+    }
+
+    async fn start_codec2_stream(
+        &mut self,
+        profile: Profile,
+        frames_rx: mpsc::Receiver<RawAudioFrame>,
+    ) -> Result<(), Error> {
+        let active = self.core.active_call().ok_or(Error::NoActiveCall)?;
+        if active.call.status() != SignallingStatus::Established {
+            return Err(Error::CallNotEstablished);
+        }
+        let active_profile = active.call.profile().unwrap_or(Profile::DEFAULT);
+        if profile != active_profile {
+            return Err(Error::MediaProfileMismatch {
+                active: active_profile,
+                requested: profile,
+            });
+        }
+
+        let link_id = active.link_id;
+        self.stop_codec2_stream(Codec2TransmitStreamStopReason::Replaced)
+            .await;
+        self.media.codec2_transmit_stream = Some(ActiveCodec2TransmitStream {
+            link_id,
+            profile,
+            frames_rx,
+        });
+
+        if emit_service_event(
+            self.event_tx.clone(),
+            TelephonyServiceEvent::Codec2TransmitStreamStarted { link_id, profile },
+        )
+        .await
+        {
+            Ok(())
+        } else {
+            Err(Error::ServiceEventClosed)
+        }
+    }
+
+    async fn stop_codec2_stream(&mut self, reason: Codec2TransmitStreamStopReason) -> bool {
+        let Some(stream) = self.media.codec2_transmit_stream.take() else {
+            return true;
+        };
+        emit_service_event(
+            self.event_tx.clone(),
+            TelephonyServiceEvent::Codec2TransmitStreamStopped {
+                link_id: stream.link_id,
+                profile: stream.profile,
+                reason,
+            },
+        )
+        .await
+    }
+
+    async fn pump_codec2_stream(&mut self) -> bool {
+        let Some((profile, frames, source_closed)) = self.drain_codec2_stream_frames() else {
+            return true;
+        };
+
+        if !frames.is_empty()
+            && let Err(err) = self.send_codec2_frames(profile, frames).await
+        {
+            self.media.codec2_transmit_stream = None;
+            return emit_service_error(self.event_tx.clone(), err).await;
+        }
+
+        if source_closed {
+            self.stop_codec2_stream(Codec2TransmitStreamStopReason::SourceClosed)
+                .await
+        } else {
+            true
+        }
+    }
+
+    fn drain_codec2_stream_frames(&mut self) -> Option<(Profile, Vec<RawAudioFrame>, bool)> {
+        let stream = self.media.codec2_transmit_stream.as_mut()?;
+        let mut frames = Vec::new();
+        let mut source_closed = false;
+        let max_frames = self.config.media_frames_per_tick.max(1);
+
+        for _ in 0..max_frames {
+            match stream.frames_rx.try_recv() {
+                Ok(frame) => frames.push(frame),
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    source_closed = true;
+                    break;
+                }
+            }
+        }
+
+        if frames.is_empty() && !source_closed {
+            None
+        } else {
+            Some((stream.profile, frames, source_closed))
+        }
+    }
+
+    async fn send_codec2_frames(
+        &mut self,
+        profile: Profile,
+        frames: Vec<RawAudioFrame>,
+    ) -> Result<(), Error> {
+        let active = self.core.active_call().ok_or(Error::NoActiveCall)?;
+        if active.call.status() != SignallingStatus::Established {
+            return Err(Error::CallNotEstablished);
+        }
+        let active_profile = active.call.profile().unwrap_or(Profile::DEFAULT);
+        if profile != active_profile {
+            return Err(Error::MediaProfileMismatch {
+                active: active_profile,
+                requested: profile,
+            });
+        }
+
+        let link_id = active.link_id;
+        let frame_count = frames.len();
+        let encoded = {
+            let encoder = self.media.codec2_encoder_for(link_id, profile)?;
+            frames
+                .iter()
+                .map(|frame| encoder.encode_frame(frame))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let packet_count = self.endpoint.queue_frames(link_id, encoded)?;
+        if emit_service_event(
+            self.event_tx.clone(),
+            TelephonyServiceEvent::MediaSent {
+                link_id,
+                frames: frame_count,
+                packets: packet_count,
+            },
+        )
+        .await
+        {
+            Ok(())
+        } else {
+            Err(Error::ServiceEventClosed)
+        }
+    }
+
+    fn codec2_received_events(
+        &mut self,
+        step: &TelephonyStep,
+    ) -> Result<Vec<TelephonyServiceEvent>, Error> {
+        let Some(inbound) = step.inbound.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let codec2_frames = inbound
+            .frame_events
+            .iter()
+            .filter_map(|event| match event {
+                FrameStreamEvent::Frame(frame) if frame.codec == CodecKind::Codec2 => Some(frame),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if codec2_frames.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let active = self.core.active_call().ok_or(Error::NoActiveCall)?;
+        if active.link_id != inbound.link_id {
+            return Err(Error::WrongActiveLink);
+        }
+        let link_id = active.link_id;
+        let profile = active.call.profile().unwrap_or(Profile::DEFAULT);
+        let decoded = {
+            let decoder = self.media.codec2_decoder_for(active.link_id, profile)?;
+            codec2_frames
+                .iter()
+                .map(|frame| decoder.decode_frame(frame))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        let receive_stream_events = self.deliver_codec2_receive_stream(link_id, profile, &decoded);
+        let mut events = Vec::with_capacity(1 + receive_stream_events.len());
+        events.push(TelephonyServiceEvent::Codec2FramesReceived {
+            link_id,
+            profile,
+            frames: decoded,
+        });
+        events.extend(receive_stream_events);
+        Ok(events)
+    }
+
+    fn deliver_codec2_receive_stream(
+        &mut self,
+        link_id: LinkId,
+        profile: Profile,
+        frames: &[RawAudioFrame],
+    ) -> Vec<TelephonyServiceEvent> {
+        let Some(stream) = self.media.codec2_receive_stream.as_ref() else {
+            return Vec::new();
+        };
+        if stream.link_id != link_id || stream.profile != profile {
+            self.media.codec2_receive_stream = None;
+            return Vec::new();
+        }
+
+        let mut delivered = 0;
+        let mut dropped = 0;
+        let mut sink_closed = false;
+        for frame in frames {
+            let Some(stream) = self.media.codec2_receive_stream.as_ref() else {
+                break;
+            };
+            match stream.frames_tx.try_send(frame.clone()) {
+                Ok(()) => delivered += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => dropped += 1,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    sink_closed = true;
+                    break;
+                }
+            }
+        }
+
+        let mut events = Vec::new();
+        if delivered > 0 || dropped > 0 {
+            events.push(TelephonyServiceEvent::Codec2ReceiveStreamFrames {
+                link_id,
+                profile,
+                frames: delivered,
+                dropped,
+            });
+        }
+        if sink_closed && let Some(stream) = self.media.codec2_receive_stream.take() {
+            events.push(TelephonyServiceEvent::Codec2ReceiveStreamStopped {
+                link_id: stream.link_id,
+                profile: stream.profile,
+                reason: Codec2ReceiveStreamStopReason::SinkClosed,
             });
         }
         events

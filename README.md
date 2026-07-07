@@ -47,7 +47,6 @@ the reference implementation LXST.
 The experimental release is to cover basic voice calls, with several features still unsupported:
 
 - `rnphone` parity and `rnphone-rs` usage.
-- Full Codec2 support.
 - Deeper audio support: microphone/source backends, filters, AGC, etc.
 - Broadcast, stream, and non-telephony LXST primitives.
 
@@ -149,7 +148,7 @@ cargo test --workspace
 ```
 
 The test gate covers wire codecs, telephony state, profile metadata, Opus
-stream boundaries, malformed-input handling, the local service runtime, Python
+and Codec2 stream boundaries, malformed-input handling, the local service runtime, Python
 LXST wire parity, Reticulum destination parity, and live headless LXST
 Telephone interop. The Python tests expect upstream LXST at `../upstream/LXST`
 or `LXST_UPSTREAM_DIR`, and upstream Reticulum at `../upstream/Reticulum`,
@@ -166,9 +165,9 @@ python -m pip install numpy cryptography pyserial cffi
 
 | Crate | Purpose |
 | --- | --- |
-| `lxst-core` | LXST constants, telephony profiles, signalling values, codec IDs, MessagePack packets, Raw audio frames, Opus encode/decode state, stream packetization, synthetic sources, and jitter buffers. This crate has no Reticulum runtime dependency. |
+| `lxst-core` | LXST constants, telephony profiles, signalling values, codec IDs, MessagePack packets, Raw audio frames, Opus and Codec2 encode/decode state, stream packetization, synthetic sources, and jitter buffers. This crate has no Reticulum runtime dependency. |
 | `lxst-rns` | The Reticulum link-packet boundary for no-receipt LXST signalling and media over active links. It packs outbound LXST packets and decodes inbound link plaintext into typed LXST packet/frame events. |
-| `lxst-telephony` | The telephony runtime and service layer. It owns call state, caller policy, Reticulum destination registration, announce discovery, outgoing link establishment, typed control/event channels, Opus transmit/receive stream boundaries, timeout handling, and shutdown teardown. |
+| `lxst-telephony` | The telephony runtime and service layer. It owns call state, caller policy, Reticulum destination registration, announce discovery, outgoing link establishment, typed control/event channels, Opus and Codec2 transmit/receive stream boundaries, timeout handling, and shutdown teardown. |
 
 ## Using Telephony
 
@@ -206,9 +205,27 @@ service, so an unreachable or non-LXST peer does not block hangup, announce,
 media, or shutdown controls while discovery times out.
 
 For Opus calls, applications supply and receive `RawAudioFrame` values through
-`StartOpusStream` and `StartOpusReceiveStream`. rsLXST enforces the negotiated
-LXST profile and reports profile changes, source/sink closure, frame drops, and
-call-end stream shutdown explicitly.
+`StartOpusStream` and `StartOpusReceiveStream`. For bandwidth profiles that use
+Codec2, use `StartCodec2Stream` and `StartCodec2ReceiveStream` (or the one-shot
+`SendCodec2Frames` control). rsLXST enforces the negotiated LXST profile and
+reports profile changes, source/sink closure, frame drops, and call-end stream
+shutdown explicitly.
+
+Codec2 modes 1200–3200 use the pure-Rust `codec2` crate. Mode 700C requires the
+optional `libcodec2` feature and a system `libcodec2` install:
+
+```bash
+# Debian/Ubuntu/Raspberry Pi OS
+sudo apt install libcodec2-dev pkg-config
+
+# macOS
+brew install codec2 pkg-config
+
+cargo test -p lxst-core --features libcodec2
+```
+
+If headers or libraries live outside the usual paths, set `CODEC2_INCLUDE_DIR`
+and `CODEC2_LIBRARY_DIR` before building.
 
 Applications still own platform integration:
 
