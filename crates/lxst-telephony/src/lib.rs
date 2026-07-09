@@ -2593,6 +2593,9 @@ impl TelephonyRnsEndpoint {
             TELEPHONY_DESTINATION_NAME,
             identity.get_signing_key(),
         );
+        // Match Python LXST / Destination.PROVE_NONE: real-time media must not
+        // emit per-packet delivery proofs that saturate slow interfaces.
+        manager.set_proof_strategy(ProofStrategy::ProveNone);
         let (established_tx, link_established_rx) = mpsc::channel(64);
         let (identified_tx, link_identified_rx) = mpsc::channel(64);
         let (packet_tx, link_packet_rx) = mpsc::channel(256);
