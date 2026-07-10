@@ -1787,11 +1787,17 @@ impl TelephonyService {
             return true;
         };
 
-        if !frames.is_empty()
-            && let Err(err) = self.send_opus_frames(profile, frames).await
-        {
-            self.media.opus_transmit_stream = None;
-            return emit_service_error(self.event_tx.clone(), err).await;
+        if !frames.is_empty() {
+            match self.send_opus_frames(profile, frames).await {
+                Ok(()) => {}
+                Err(Error::TransportFull) => {
+                    emit_service_error(self.event_tx.clone(), Error::TransportFull).await;
+                }
+                Err(err) => {
+                    self.media.opus_transmit_stream = None;
+                    return emit_service_error(self.event_tx.clone(), err).await;
+                }
+            }
         }
 
         if source_closed {
@@ -2205,11 +2211,17 @@ impl TelephonyService {
             return true;
         };
 
-        if !frames.is_empty()
-            && let Err(err) = self.send_codec2_frames(profile, frames).await
-        {
-            self.media.codec2_transmit_stream = None;
-            return emit_service_error(self.event_tx.clone(), err).await;
+        if !frames.is_empty() {
+            match self.send_codec2_frames(profile, frames).await {
+                Ok(()) => {}
+                Err(Error::TransportFull) => {
+                    emit_service_error(self.event_tx.clone(), Error::TransportFull).await;
+                }
+                Err(err) => {
+                    self.media.codec2_transmit_stream = None;
+                    return emit_service_error(self.event_tx.clone(), err).await;
+                }
+            }
         }
 
         if source_closed {
