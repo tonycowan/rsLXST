@@ -25,16 +25,19 @@ as the primary focus. Python LXST remains the source-of-truth
 implementation, do not treat this repository as one.
 
 The current rsLXST is experimental and incomplete. It provides LXST wire codecs,
-Reticulum link media packet boundaries, a telephony runtime, and Opus stream
-integration for applications (such as Ratspeak).
+Reticulum link media packet boundaries, a telephony runtime, Opus and Codec2
+stream integration, and consensus-based adaptive profile negotiation for
+applications (such as Ratspeak).
 
-The first public target is interoperable Opus
-telephony, not complete feature parity with
-the reference implementation LXST.
+The first public target is interoperable voice telephony over Reticulum links —
+Codec2 for narrowband mesh paths and Opus for higher-quality links — not
+complete feature parity with the reference implementation LXST.
 
 ## Contents
 
 - [Release Scope](#release-scope)
+- [Voice Profiles](#voice-profiles)
+- [Adaptive Profile Negotiation](#adaptive-profile-negotiation)
 - [Build It](#build-it)
 - [Test It](#test-it)
 - [Crate Layout](#crate-layout)
@@ -44,14 +47,115 @@ the reference implementation LXST.
 
 ## Release Scope
 
-The experimental release is to cover basic voice calls, with several features still unsupported:
+The experimental release covers basic voice calls over Reticulum links:
+
+- Opus and Codec2 encode/decode, stream packetization, and jitter buffers.
+- LXST telephony signalling, call state, and profile switches mid-call.
+- Consensus-based profile upgrades (`UpgradeProposal` / `UpgradeAccept`) and
+  immediate downgrades (`PreferredProfile`).
+- Python LXST wire parity and live headless interop tests.
+
+Still unsupported or incomplete:
 
 - `rnphone` parity and `rnphone-rs` usage.
 - Deeper audio support: microphone/source backends, filters, AGC, etc.
 - Broadcast, stream, and non-telephony LXST primitives.
+- Application-side adaptive negotiation policy (Ratspeak implements this on
+  top of the telephony controls documented below).
 
-Those are expected future work. They should not be implied by the first public
-Opus telephony release.
+Those gaps are expected future work. They should not be implied by the first
+public voice telephony release.
+
+## Voice Profiles
+
+LXST telephony profiles map to a codec, frame time, and bandwidth target. The
+profiles most relevant to mesh voice are:
+
+| Profile | Abbrev. | Codec | Frame time |
+| --- | --- | --- | --- |
+| `BandwidthUltraLow` | ULBW | Codec2 700C | 400 ms |
+| `BandwidthVeryLow` | VLBW | Codec2 1600 | 320 ms |
+| `BandwidthLow` | LBW | Codec2 3200 | 200 ms |
+| `QualityMedium` | MQ | Opus voice (mono) | 60 ms |
+| `QualityHigh` | HQ | Opus voice (mono, higher bitrate) | 60 ms |
+| `QualityMax` | SHQ | Opus voice (stereo) | 60 ms |
+
+Latency-oriented Opus profiles (`LatencyLow`, `LatencyUltraLow`) exist for
+reference parity but are not part of the adaptive climb ladder Ratspeak uses
+today.
+
+Codec2 modes 1200–3200 use the pure-Rust `codec2` crate. Mode 700C requires the
+optional `libcodec2` feature and a system `libcodec2` install (see [Using
+Telephony](#using-telephony)).
+
+## Adaptive Profile Negotiation
+
+rsLXST exposes the wire protocol and telephony controls for mid-call quality
+changes. **Policy** — when to climb, when to fall back, and health thresholds
+— lives in the application. [Ratspeak](https://github.com/ratspeak/Ratspeak)
+is the reference consumer.
+
+### Signalling
+
+Three LXST wire signals drive negotiation:
+
+| Signal | Direction | Purpose |
+| --- | --- | --- |
+| `PreferredProfile` | Either peer, immediate | Switch to a lower (or equal) profile. Used for congestion downgrades. |
+| `UpgradeProposal` | Proposer → peer | Offer a single-step climb to the next profile on the ladder. |
+| `UpgradeAccept` | Peer → proposer | Accept a pending proposal; both sides switch together. |
+
+Wire values are `0x180 + profile` for proposals and `0x210 + profile` for
+accepts, where `profile` is the LXST profile wire ID (for example `0x20` for
+`BandwidthVeryLow` / Codec2 1600).
+
+The legacy `UpgradePermission` signal (`0xFE`) is still decoded for reference
+parity but is not used by current Ratspeak builds.
+
+### Telephony API
+
+Applications drive negotiation through `TelephonyControl` and observe it on
+`TelephonyServiceEvent`:
+
+```rust
+// Downgrade (or equal-profile switch) — sends PreferredProfile
+TelephonyControl::SwitchProfile { profile }
+
+// Consensus upgrade — proposer sends UpgradeProposal, peer replies AcceptUpgrade
+TelephonyControl::SendUpgradeProposal { profile }
+TelephonyControl::AcceptUpgrade { profile }
+```
+
+Matching events: `SwitchProfile`, `UpgradeProposalReceived`, and
+`UpgradeAcceptReceived`. After an accepted upgrade or a `PreferredProfile`
+downgrade, the service tears down the active encode/decode stream and expects
+the application to restart capture/playback at the new profile.
+
+### Ratspeak adaptive ladder (reference policy)
+
+Ratspeak starts calls at **Codec2 1600** (`BandwidthVeryLow`) and climbs only
+when both sides agree the path is healthy:
+
+```text
+Codec2 1600 → Codec2 3200 → Opus MQ → Opus HQ
+```
+
+The adaptive path stops at Opus HQ. Opus Max remains available for manual or
+environment overrides (`RATSPEAK_VOICE_PROFILE`) but is not proposed
+automatically — HQ is mono 16 kbps and a better fit for telephony and mesh
+airtime than stereo Opus Max.
+
+| Behaviour | Detail |
+| --- | --- |
+| **Upgrades** | Consensus only. The side holding the upgrade token proposes after ~3 s stable at the current tier; the peer accepts if its local path health is OK. ~2 s cooldown between switches; proposals time out after 10 s. |
+| **Downgrades** | Either side can drop immediately via `PreferredProfile` when it sees sustained congestion: ≥4 dropped frames, transport queue pressure, or playback underruns (~50 ms @ 48 kHz) after a 2 s grace period following a profile switch. |
+| **Token** | Callee holds the upgrade token at call start. After a downgrade, the downgrading side holds it; after a successful upgrade, it returns to the callee. |
+
+On fast WiFi links, calls typically reach Opus HQ within ~15 s. On constrained
+LoRa paths, the ladder may attempt higher tiers but usually settles back at
+Codec2 1600 when Opus playback cannot keep up — that is expected path
+behaviour, not a protocol failure. There is no per-link-type configuration;
+the same policy runs on every interface.
 
 ## Build It
 
@@ -199,10 +303,11 @@ control_tx
 The service event stream is the app-facing state source. Use
 `TelephonyServiceEvent::Snapshot`, `IncomingCall`, `OutgoingCallPending`,
 `OutgoingCallStarted`, `OutgoingCallFailed`, `CallTerminated`, stream lifecycle
-events, and media events instead of inferring call state from raw Reticulum
-traffic. Outgoing announce/path discovery runs asynchronously inside the
-service, so an unreachable or non-LXST peer does not block hangup, announce,
-media, or shutdown controls while discovery times out.
+events, profile negotiation events (`SwitchProfile`, `UpgradeProposalReceived`,
+`UpgradeAcceptReceived`), and media events instead of inferring call state from
+raw Reticulum traffic. Outgoing announce/path discovery runs asynchronously
+inside the service, so an unreachable or non-LXST peer does not block hangup,
+announce, media, or shutdown controls while discovery times out.
 
 For Opus calls, applications supply and receive `RawAudioFrame` values through
 `StartOpusStream` and `StartOpusReceiveStream`. For bandwidth profiles that use
