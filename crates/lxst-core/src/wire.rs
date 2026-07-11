@@ -9,6 +9,7 @@ pub const FIELD_SIGNALLING: u8 = 0x00;
 pub const FIELD_FRAMES: u8 = 0x01;
 
 const PREFERRED_PROFILE_BASE: u32 = 0xFF;
+pub const UPGRADE_PERMISSION_WIRE: u32 = 0xFE;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Error {
@@ -79,6 +80,7 @@ impl CodecKind {
 pub enum Signal {
     Status(SignallingStatus),
     PreferredProfile(Profile),
+    UpgradePermission,
     Raw(u32),
 }
 
@@ -87,6 +89,7 @@ impl Signal {
         match self {
             Self::Status(status) => status.wire_value(),
             Self::PreferredProfile(profile) => PREFERRED_PROFILE_BASE + profile.wire_value(),
+            Self::UpgradePermission => UPGRADE_PERMISSION_WIRE,
             Self::Raw(value) => value,
         }
     }
@@ -94,6 +97,8 @@ impl Signal {
     pub const fn from_wire(value: u32) -> Self {
         if let Some(status) = SignallingStatus::from_wire(value) {
             Self::Status(status)
+        } else if value == UPGRADE_PERMISSION_WIRE {
+            Self::UpgradePermission
         } else if value >= PREFERRED_PROFILE_BASE {
             let profile_value = value - PREFERRED_PROFILE_BASE;
             if let Some(profile) = Profile::from_wire(profile_value) {
@@ -484,6 +489,13 @@ mod tests {
             LxstPacket::frame(Frame::new(CodecKind::Null, [])).encode(),
             Err(Error::NonTransmittableCodec(CodecKind::Null))
         );
+    }
+
+    #[test]
+    fn upgrade_permission_signal_roundtrip() {
+        let signal = Signal::UpgradePermission;
+        assert_eq!(signal.wire_value(), UPGRADE_PERMISSION_WIRE);
+        assert_eq!(Signal::from_wire(UPGRADE_PERMISSION_WIRE), signal);
     }
 
     #[test]

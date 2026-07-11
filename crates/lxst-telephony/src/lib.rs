@@ -188,6 +188,9 @@ pub enum TelephonyCommand {
         link_id: LinkId,
         signal: Signal,
     },
+    UpgradePermissionReceived {
+        link_id: LinkId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +225,8 @@ impl TelephonyCommand {
             | Self::RingIncomingCall { link_id, .. }
             | Self::CallTerminated { link_id, .. }
             | Self::TeardownLink { link_id }
-            | Self::IgnoredSignal { link_id, .. } => *link_id,
+            | Self::IgnoredSignal { link_id, .. }
+            | Self::UpgradePermissionReceived { link_id } => *link_id,
         }
     }
 
@@ -462,6 +466,18 @@ impl TelephonyRuntimeCore {
         Ok(self.commands_from_actions(link_id, Some(remote_identity), actions))
     }
 
+    pub fn grant_upgrade_permission(&mut self) -> Result<Vec<TelephonyCommand>, Error> {
+        let active = self.active_call.as_mut().ok_or(Error::NoActiveCall)?;
+        if active.call.status() != SignallingStatus::Established {
+            return Err(Error::CallNotEstablished);
+        }
+
+        let link_id = active.link_id;
+        let remote_identity = active.remote_identity;
+        let actions = active.call.grant_upgrade_permission();
+        Ok(self.commands_from_actions(link_id, Some(remote_identity), actions))
+    }
+
     pub fn hangup_active(&mut self, ring_timeout: bool) -> Result<Vec<TelephonyCommand>, Error> {
         let Some(mut active) = self.active_call.take() else {
             return Err(Error::NoActiveCall);
@@ -663,6 +679,9 @@ impl TelephonyRuntimeCore {
                 TelephonyAction::IgnoreSignal(signal) => {
                     Some(TelephonyCommand::IgnoredSignal { link_id, signal })
                 }
+                TelephonyAction::UpgradePermissionReceived => {
+                    Some(TelephonyCommand::UpgradePermissionReceived { link_id })
+                }
                 TelephonyAction::Terminate(_) => None,
             })
             .collect()
@@ -714,6 +733,7 @@ pub enum TelephonyControl {
     SwitchProfile {
         profile: Profile,
     },
+    GrantUpgradePermission,
     SetExternalBusy(bool),
     SetAccessPolicy(CallerAccessPolicy),
     Shutdown,
@@ -842,6 +862,9 @@ pub enum TelephonyServiceEvent {
         profile: Profile,
         frames: usize,
         dropped: usize,
+    },
+    UpgradePermissionReceived {
+        link_id: LinkId,
     },
     Snapshot(TelephonyRuntimeSnapshot),
     Drive(TelephonyDriveStep),
@@ -1544,6 +1567,10 @@ impl TelephonyService {
             }
             TelephonyControl::SwitchProfile { profile } => {
                 let commands = self.core.switch_active_profile(profile);
+                self.control_commands(commands).await
+            }
+            TelephonyControl::GrantUpgradePermission => {
+                let commands = self.core.grant_upgrade_permission();
                 self.control_commands(commands).await
             }
             TelephonyControl::SetExternalBusy(busy) => {
@@ -2497,6 +2524,11 @@ fn service_events_from_commands(commands: &[TelephonyCommand]) -> Vec<TelephonyS
                 Some(TelephonyServiceEvent::CallTerminated {
                     link_id: *link_id,
                     reason: *reason,
+                })
+            }
+            TelephonyCommand::UpgradePermissionReceived { link_id } => {
+                Some(TelephonyServiceEvent::UpgradePermissionReceived {
+                    link_id: *link_id,
                 })
             }
             _ => None,

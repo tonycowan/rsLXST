@@ -20,6 +20,7 @@ pub enum TelephonyAction {
     TeardownLink,
     RingIncomingCall,
     SwitchProfile(Profile),
+    UpgradePermissionReceived,
     IgnoreSignal(Signal),
 }
 
@@ -163,8 +164,17 @@ impl TelephonyCall {
                     vec![TelephonyAction::SelectProfile(profile)]
                 }
             }
+            Signal::UpgradePermission => vec![TelephonyAction::UpgradePermissionReceived],
             Signal::Raw(_) => vec![TelephonyAction::IgnoreSignal(signal)],
         }
+    }
+
+    pub fn grant_upgrade_permission(&mut self) -> Vec<TelephonyAction> {
+        if self.role != CallRole::Outgoing || self.status != SignallingStatus::Established {
+            return Vec::new();
+        }
+
+        vec![TelephonyAction::SendSignal(Signal::UpgradePermission)]
     }
 
     pub fn switch_profile(&mut self, profile: Profile) -> Vec<TelephonyAction> {
@@ -374,5 +384,34 @@ mod tests {
             timeout_call.hangup(true),
             vec![TelephonyAction::TeardownLink]
         );
+    }
+
+    #[test]
+    fn upgrade_permission_received_without_changing_profile() {
+        let mut call = TelephonyCall::outgoing(Some(Profile::BandwidthVeryLow));
+        call.receive_signal(Signal::from(SignallingStatus::Established));
+
+        assert_eq!(
+            call.receive_signal(Signal::UpgradePermission),
+            vec![TelephonyAction::UpgradePermissionReceived]
+        );
+        assert_eq!(call.profile(), Some(Profile::BandwidthVeryLow));
+    }
+
+    #[test]
+    fn only_established_caller_can_grant_upgrade_permission() {
+        let mut outgoing = TelephonyCall::outgoing(Some(Profile::BandwidthVeryLow));
+        assert!(outgoing.grant_upgrade_permission().is_empty());
+
+        outgoing.receive_signal(Signal::from(SignallingStatus::Established));
+        assert_eq!(
+            outgoing.grant_upgrade_permission(),
+            vec![TelephonyAction::SendSignal(Signal::UpgradePermission)]
+        );
+
+        let mut incoming = TelephonyCall::incoming();
+        incoming.caller_identified(false, true);
+        incoming.answer();
+        assert!(incoming.grant_upgrade_permission().is_empty());
     }
 }
