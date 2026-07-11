@@ -10,6 +10,8 @@ pub const FIELD_FRAMES: u8 = 0x01;
 
 const PREFERRED_PROFILE_BASE: u32 = 0xFF;
 pub const UPGRADE_PERMISSION_WIRE: u32 = 0xFE;
+const UPGRADE_PROPOSAL_BASE: u32 = 0x180;
+const UPGRADE_ACCEPT_BASE: u32 = 0x210;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum Error {
@@ -80,6 +82,8 @@ impl CodecKind {
 pub enum Signal {
     Status(SignallingStatus),
     PreferredProfile(Profile),
+    UpgradeProposal(Profile),
+    UpgradeAccept(Profile),
     UpgradePermission,
     Raw(u32),
 }
@@ -89,6 +93,8 @@ impl Signal {
         match self {
             Self::Status(status) => status.wire_value(),
             Self::PreferredProfile(profile) => PREFERRED_PROFILE_BASE + profile.wire_value(),
+            Self::UpgradeProposal(profile) => UPGRADE_PROPOSAL_BASE + profile.wire_value(),
+            Self::UpgradeAccept(profile) => UPGRADE_ACCEPT_BASE + profile.wire_value(),
             Self::UpgradePermission => UPGRADE_PERMISSION_WIRE,
             Self::Raw(value) => value,
         }
@@ -99,6 +105,20 @@ impl Signal {
             Self::Status(status)
         } else if value == UPGRADE_PERMISSION_WIRE {
             Self::UpgradePermission
+        } else if value >= UPGRADE_ACCEPT_BASE {
+            let profile_value = value - UPGRADE_ACCEPT_BASE;
+            if let Some(profile) = Profile::from_wire(profile_value) {
+                Self::UpgradeAccept(profile)
+            } else {
+                Self::Raw(value)
+            }
+        } else if value >= UPGRADE_PROPOSAL_BASE {
+            let profile_value = value - UPGRADE_PROPOSAL_BASE;
+            if let Some(profile) = Profile::from_wire(profile_value) {
+                Self::UpgradeProposal(profile)
+            } else {
+                Self::Raw(value)
+            }
         } else if value >= PREFERRED_PROFILE_BASE {
             let profile_value = value - PREFERRED_PROFILE_BASE;
             if let Some(profile) = Profile::from_wire(profile_value) {
@@ -489,6 +509,17 @@ mod tests {
             LxstPacket::frame(Frame::new(CodecKind::Null, [])).encode(),
             Err(Error::NonTransmittableCodec(CodecKind::Null))
         );
+    }
+
+    #[test]
+    fn upgrade_proposal_and_accept_signal_roundtrip() {
+        let proposal = Signal::UpgradeProposal(Profile::BandwidthLow);
+        assert_eq!(proposal.wire_value(), UPGRADE_PROPOSAL_BASE + 0x30);
+        assert_eq!(Signal::from_wire(proposal.wire_value()), proposal);
+
+        let accept = Signal::UpgradeAccept(Profile::QualityMedium);
+        assert_eq!(accept.wire_value(), UPGRADE_ACCEPT_BASE + 0x40);
+        assert_eq!(Signal::from_wire(accept.wire_value()), accept);
     }
 
     #[test]

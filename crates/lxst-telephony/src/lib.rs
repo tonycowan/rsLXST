@@ -191,6 +191,14 @@ pub enum TelephonyCommand {
     UpgradePermissionReceived {
         link_id: LinkId,
     },
+    UpgradeProposalReceived {
+        link_id: LinkId,
+        profile: Profile,
+    },
+    UpgradeAcceptReceived {
+        link_id: LinkId,
+        profile: Profile,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,7 +234,9 @@ impl TelephonyCommand {
             | Self::CallTerminated { link_id, .. }
             | Self::TeardownLink { link_id }
             | Self::IgnoredSignal { link_id, .. }
-            | Self::UpgradePermissionReceived { link_id } => *link_id,
+            | Self::UpgradePermissionReceived { link_id }
+            | Self::UpgradeProposalReceived { link_id, .. }
+            | Self::UpgradeAcceptReceived { link_id, .. } => *link_id,
         }
     }
 
@@ -478,6 +488,33 @@ impl TelephonyRuntimeCore {
         Ok(self.commands_from_actions(link_id, Some(remote_identity), actions))
     }
 
+    pub fn send_upgrade_proposal(
+        &mut self,
+        profile: Profile,
+    ) -> Result<Vec<TelephonyCommand>, Error> {
+        let active = self.active_call.as_mut().ok_or(Error::NoActiveCall)?;
+        if active.call.status() != SignallingStatus::Established {
+            return Err(Error::CallNotEstablished);
+        }
+
+        let link_id = active.link_id;
+        let remote_identity = active.remote_identity;
+        let actions = active.call.send_upgrade_proposal(profile);
+        Ok(self.commands_from_actions(link_id, Some(remote_identity), actions))
+    }
+
+    pub fn accept_upgrade(&mut self, profile: Profile) -> Result<Vec<TelephonyCommand>, Error> {
+        let active = self.active_call.as_mut().ok_or(Error::NoActiveCall)?;
+        if active.call.status() != SignallingStatus::Established {
+            return Err(Error::CallNotEstablished);
+        }
+
+        let link_id = active.link_id;
+        let remote_identity = active.remote_identity;
+        let actions = active.call.accept_upgrade(profile);
+        Ok(self.commands_from_actions(link_id, Some(remote_identity), actions))
+    }
+
     pub fn hangup_active(&mut self, ring_timeout: bool) -> Result<Vec<TelephonyCommand>, Error> {
         let Some(mut active) = self.active_call.take() else {
             return Err(Error::NoActiveCall);
@@ -682,6 +719,12 @@ impl TelephonyRuntimeCore {
                 TelephonyAction::UpgradePermissionReceived => {
                     Some(TelephonyCommand::UpgradePermissionReceived { link_id })
                 }
+                TelephonyAction::UpgradeProposalReceived(profile) => {
+                    Some(TelephonyCommand::UpgradeProposalReceived { link_id, profile })
+                }
+                TelephonyAction::UpgradeAcceptReceived(profile) => {
+                    Some(TelephonyCommand::UpgradeAcceptReceived { link_id, profile })
+                }
                 TelephonyAction::Terminate(_) => None,
             })
             .collect()
@@ -734,6 +777,12 @@ pub enum TelephonyControl {
         profile: Profile,
     },
     GrantUpgradePermission,
+    SendUpgradeProposal {
+        profile: Profile,
+    },
+    AcceptUpgrade {
+        profile: Profile,
+    },
     SetExternalBusy(bool),
     SetAccessPolicy(CallerAccessPolicy),
     Shutdown,
@@ -865,6 +914,14 @@ pub enum TelephonyServiceEvent {
     },
     UpgradePermissionReceived {
         link_id: LinkId,
+    },
+    UpgradeProposalReceived {
+        link_id: LinkId,
+        profile: Profile,
+    },
+    UpgradeAcceptReceived {
+        link_id: LinkId,
+        profile: Profile,
     },
     Snapshot(TelephonyRuntimeSnapshot),
     Drive(TelephonyDriveStep),
@@ -1571,6 +1628,14 @@ impl TelephonyService {
             }
             TelephonyControl::GrantUpgradePermission => {
                 let commands = self.core.grant_upgrade_permission();
+                self.control_commands(commands).await
+            }
+            TelephonyControl::SendUpgradeProposal { profile } => {
+                let commands = self.core.send_upgrade_proposal(profile);
+                self.control_commands(commands).await
+            }
+            TelephonyControl::AcceptUpgrade { profile } => {
+                let commands = self.core.accept_upgrade(profile);
                 self.control_commands(commands).await
             }
             TelephonyControl::SetExternalBusy(busy) => {
@@ -2529,6 +2594,18 @@ fn service_events_from_commands(commands: &[TelephonyCommand]) -> Vec<TelephonyS
             TelephonyCommand::UpgradePermissionReceived { link_id } => {
                 Some(TelephonyServiceEvent::UpgradePermissionReceived {
                     link_id: *link_id,
+                })
+            }
+            TelephonyCommand::UpgradeProposalReceived { link_id, profile } => {
+                Some(TelephonyServiceEvent::UpgradeProposalReceived {
+                    link_id: *link_id,
+                    profile: *profile,
+                })
+            }
+            TelephonyCommand::UpgradeAcceptReceived { link_id, profile } => {
+                Some(TelephonyServiceEvent::UpgradeAcceptReceived {
+                    link_id: *link_id,
+                    profile: *profile,
                 })
             }
             _ => None,

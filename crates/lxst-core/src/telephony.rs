@@ -20,6 +20,8 @@ pub enum TelephonyAction {
     TeardownLink,
     RingIncomingCall,
     SwitchProfile(Profile),
+    UpgradeProposalReceived(Profile),
+    UpgradeAcceptReceived(Profile),
     UpgradePermissionReceived,
     IgnoreSignal(Signal),
 }
@@ -164,9 +166,51 @@ impl TelephonyCall {
                     vec![TelephonyAction::SelectProfile(profile)]
                 }
             }
+            Signal::UpgradeProposal(profile) => {
+                vec![TelephonyAction::UpgradeProposalReceived(profile)]
+            }
+            Signal::UpgradeAccept(profile) => {
+                if self.profile == Some(profile) {
+                    return Vec::new();
+                }
+
+                self.profile = Some(profile);
+                if self.status == SignallingStatus::Established {
+                    vec![
+                        TelephonyAction::UpgradeAcceptReceived(profile),
+                        TelephonyAction::SwitchProfile(profile),
+                    ]
+                } else {
+                    vec![
+                        TelephonyAction::UpgradeAcceptReceived(profile),
+                        TelephonyAction::SelectProfile(profile),
+                    ]
+                }
+            }
             Signal::UpgradePermission => vec![TelephonyAction::UpgradePermissionReceived],
             Signal::Raw(_) => vec![TelephonyAction::IgnoreSignal(signal)],
         }
+    }
+
+    pub fn send_upgrade_proposal(&mut self, profile: Profile) -> Vec<TelephonyAction> {
+        if self.status != SignallingStatus::Established {
+            return Vec::new();
+        }
+
+        vec![TelephonyAction::SendSignal(Signal::UpgradeProposal(profile))]
+    }
+
+    pub fn accept_upgrade(&mut self, profile: Profile) -> Vec<TelephonyAction> {
+        if self.status != SignallingStatus::Established {
+            return Vec::new();
+        }
+
+        let mut actions = vec![TelephonyAction::SendSignal(Signal::UpgradeAccept(profile))];
+        if self.profile != Some(profile) {
+            self.profile = Some(profile);
+            actions.push(TelephonyAction::SwitchProfile(profile));
+        }
+        actions
     }
 
     pub fn grant_upgrade_permission(&mut self) -> Vec<TelephonyAction> {
@@ -383,6 +427,59 @@ mod tests {
         assert_eq!(
             timeout_call.hangup(true),
             vec![TelephonyAction::TeardownLink]
+        );
+    }
+
+    #[test]
+    fn upgrade_proposal_received_without_changing_profile() {
+        let mut call = TelephonyCall::outgoing(Some(Profile::BandwidthVeryLow));
+        call.receive_signal(Signal::from(SignallingStatus::Established));
+
+        assert_eq!(
+            call.receive_signal(Signal::UpgradeProposal(Profile::BandwidthLow)),
+            vec![TelephonyAction::UpgradeProposalReceived(Profile::BandwidthLow)]
+        );
+        assert_eq!(call.profile(), Some(Profile::BandwidthVeryLow));
+    }
+
+    #[test]
+    fn upgrade_accept_switches_established_call_profile() {
+        let mut call = TelephonyCall::outgoing(Some(Profile::BandwidthVeryLow));
+        call.receive_signal(Signal::from(SignallingStatus::Established));
+
+        assert_eq!(
+            call.receive_signal(Signal::UpgradeAccept(Profile::BandwidthLow)),
+            vec![
+                TelephonyAction::UpgradeAcceptReceived(Profile::BandwidthLow),
+                TelephonyAction::SwitchProfile(Profile::BandwidthLow),
+            ]
+        );
+        assert_eq!(call.profile(), Some(Profile::BandwidthLow));
+    }
+
+    #[test]
+    fn established_caller_can_send_upgrade_proposal() {
+        let mut outgoing = TelephonyCall::outgoing(Some(Profile::BandwidthVeryLow));
+        outgoing.receive_signal(Signal::from(SignallingStatus::Established));
+        assert_eq!(
+            outgoing.send_upgrade_proposal(Profile::BandwidthLow),
+            vec![TelephonyAction::SendSignal(Signal::UpgradeProposal(
+                Profile::BandwidthLow
+            ))]
+        );
+    }
+
+    #[test]
+    fn established_callee_can_accept_upgrade() {
+        let mut incoming = TelephonyCall::incoming();
+        incoming.caller_identified(false, true);
+        incoming.answer();
+        assert_eq!(
+            incoming.accept_upgrade(Profile::BandwidthLow),
+            vec![
+                TelephonyAction::SendSignal(Signal::UpgradeAccept(Profile::BandwidthLow)),
+                TelephonyAction::SwitchProfile(Profile::BandwidthLow),
+            ]
         );
     }
 
